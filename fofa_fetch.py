@@ -480,103 +480,47 @@ def get_isp_by_regex(ip):
     return "未知"
 
 # ===============================
-# 优化后的第一阶段
+# 第一阶段（优化：增加IP去重和验证）
 def first_stage():
     os.makedirs(IP_DIR, exist_ok=True)
-    
-    # --- 新增配置参数 ---
-    MAX_IPS_PER_RUN = 1000  # 每次运行最多处理的新IP数量
-    MAX_WORKERS = 20        # IP查询并发数
-    FOFA_PAGE_SIZE = 50     # FOFA每页显示数量，设为和你的FOFA设置一致
-    # -------------------
-
-    all_new_ips = set()  # 用于存放本次找到的、且不在已有文件中的新IP
+    all_ips = set()
 
     for url, filename in FOFA_URLS.items():
-        print(f"📡 正在从FOFA获取数据: {filename}")
-        
-        # 1. 先获取总记录数和总页数
+        print(f"📡 正在爬取 {filename} ...")
         try:
-            # 只取第一页来解析总记录数
             r = requests.get(url, headers=HEADERS, timeout=15)
-            # 从FOFA页面中尝试提取总记录数 (需要根据实际页面结构调整)
-            total_match = re.search(r'([\d,]+)\s*条匹配结果', r.text)
-            if total_match:
-                total_count = int(total_match.group(1).replace(',', ''))
-                total_pages = (total_count + FOFA_PAGE_SIZE - 1) // FOFA_PAGE_SIZE
-                print(f"  发现 {total_count} 条结果，共 {total_pages} 页")
-            else:
-                print("  无法解析总页数，将只处理第一页")
-                total_pages = 1
+            urls_all = re.findall(r'<a href="http://(.*?)"', r.text)
+            # 基本验证IP格式
+            for u in urls_all:
+                u = u.strip()
+                if u and ':' in u:
+                    ip_part = u.split(':')[0]
+                    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip_part) or re.match(r'^[a-zA-Z0-9.-]+$', ip_part):
+                        all_ips.add(u)
         except Exception as e:
-            print(f"❌ 获取FOFA页面信息失败: {e}")
-            continue
+            print(f"❌ 爬取失败：{e}")
+        time.sleep(3)
 
-        # 2. 随机选择一些页面进行爬取，控制总数
-        # 确定要抓取的页面数量，最多不超过总页数
-        pages_to_fetch = min(10, total_pages)  # 最多抓取10页
-        selected_pages = sorted(random.sample(range(1, total_pages + 1), pages_to_fetch))
-        print(f"  将随机抽取 {pages_to_fetch} 页进行爬取: {selected_pages}")
+    province_isp_dict = {}
 
-        page_ips = set()
-        for page_num in selected_pages:
-            try:
-                page_url = f"{url}&page={page_num}&size={FOFA_PAGE_SIZE}"
-                r = requests.get(page_url, headers=HEADERS, timeout=15)
-                urls_all = re.findall(r'<a href="http://(.*?)"', r.text)
-                for u in urls_all:
-                    u = u.strip()
-                    if u and ':' in u:
-                        ip_part = u.split(':')[0]
-                        if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip_part) or re.match(r'^[a-zA-Z0-9.-]+$', ip_part):
-                            page_ips.add(u)
-                print(f"    第{page_num}页: 获取到 {len(urls_all)} 个链接")
-                time.sleep(2)  # 礼貌性延迟
-            except Exception as e:
-                print(f"    第{page_num}页爬取失败: {e}")
-        
-        print(f"  FOFA页面共获取到 {len(page_ips)} 个待处理IP")
-        
-        # 3. 过滤掉已经存在的IP
-        existing_ips = set()
-        for fname in os.listdir(IP_DIR):
-            if fname.endswith(".txt"):
-                try:
-                    with open(os.path.join(IP_DIR, fname), 'r', encoding='utf-8') as f:
-                        existing_ips.update(line.strip() for line in f if line.strip())
-                except:
-                    pass
-        
-        new_ips = page_ips - existing_ips
-        print(f"  其中新IP: {len(new_ips)} 个")
-        
-        # 如果新IP超过单次限制，就随机抽样
-        if len(new_ips) > MAX_IPS_PER_RUN:
-            new_ips = set(random.sample(list(new_ips), MAX_IPS_PER_RUN))
-            print(f"  超过单次限制，随机保留 {MAX_IPS_PER_RUN} 个进行处理")
-        
-        all_new_ips.update(new_ips)
-
-    print(f"📊 本次总共需要处理 {len(all_new_ips)} 个新IP")
-
-    # 4. 并发查询IP归属地
-    province_isp_dict = defaultdict(set)
-    
-    def process_ip(ip_port):
+    for ip_port in all_ips:
         try:
             host = ip_port.split(":")[0]
+
             is_ip = re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host)
-            
+
             if not is_ip:
                 try:
                     resolved_ip = socket.gethostbyname(host)
+                    print(f"🌐 域名解析成功: {host} → {resolved_ip}")
                     ip = resolved_ip
                 except Exception:
-                    return None
+                    print(f"❌ 域名解析失败，跳过：{ip_port}")
+                    continue
             else:
                 ip = host
 
-            # 查询归属地
+            # 增加重试机制
             for retry in range(3):
                 try:
                     res = requests.get(f"http://ip-api.com/json/{ip}?lang=zh-CN", timeout=10)
@@ -585,7 +529,7 @@ def first_stage():
                         break
                 except:
                     if retry == 2:
-                        return None
+                        raise
                     time.sleep(1)
 
             province = data.get("regionName", "未知")
@@ -595,44 +539,38 @@ def first_stage():
                 isp = get_isp_by_regex(ip)
 
             if isp == "未知":
-                return None
+                print(f"⚠️ 无法判断运营商，跳过：{ip_port}")
+                continue
 
-            return (f"{province}{isp}.txt", ip_port)
-            
-        except Exception:
-            return None
+            fname = f"{province}{isp}.txt"
+            province_isp_dict.setdefault(fname, set()).add(ip_port)
 
-    # 使用线程池并发处理
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_ip, ip_port): ip_port for ip_port in all_new_ips}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                filename, ip_port = result
-                province_isp_dict[filename].add(ip_port)
+        except Exception as e:
+            print(f"⚠️ 解析 {ip_port} 出错：{e}")
+            continue
 
-    # 5. 更新IP文件（增量写入）
+    count = get_run_count() + 1
+    save_run_count(count)
+
     for filename, ip_set in province_isp_dict.items():
         path = os.path.join(IP_DIR, filename)
         try:
-            # 读取现有IP
+            # 读取现有IP去重
             existing_ips = set()
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     existing_ips = set(line.strip() for line in f if line.strip())
             
-            # 合并新IP并写入
+            # 合并新IP
             all_ips = existing_ips.union(ip_set)
+            
             with open(path, "w", encoding="utf-8") as f:
                 for ip_port in sorted(all_ips):
                     f.write(ip_port + "\n")
-            print(f"📁 {path} 已更新，现有 {len(all_ips)} 个 IP（新增 {len(ip_set)}）")
+            print(f"{path} 已写入 {len(all_ips)} 个 IP（新增 {len(ip_set)}）")
         except Exception as e:
             print(f"❌ 写入 {path} 失败：{e}")
 
-    # 6. 更新计数
-    count = get_run_count() + 1
-    save_run_count(count)
     print(f"✅ 第一阶段完成，当前轮次：{count}")
     return count
 
