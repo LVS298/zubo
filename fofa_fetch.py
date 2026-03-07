@@ -4,13 +4,7 @@ import requests
 import time
 import concurrent.futures
 import subprocess
-import socket
-import json
-import threading
-import queue
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict, OrderedDict
-import random
 
 # ===============================
 # 配置区
@@ -26,19 +20,9 @@ IP_DIR = "ip"
 RTP_DIR = "rtp"
 ZUBO_FILE = "zubo.txt"
 IPTV_FILE = "IPTV.txt"
-CACHE_DIR = "cache"
-PLAYLIST_CACHE = "playlist_cache.json"
-SOURCE_STATUS_FILE = "source_status.json"
-
-# 新增配置
-MAX_SOURCES_PER_CHANNEL = 5  # 每个频道最多保留的源数量
-CHECK_TIMEOUT = 3  # 检测超时时间
-CHECK_RETRIES = 2  # 检测重试次数
-CACHE_EXPIRE = 3600  # 缓存过期时间（秒）
-SOURCE_SCORE_FILE = "source_scores.json"  # 源评分文件
 
 # ===============================
-# 分类与映射配置（保持不变）
+# 分类与映射配置
 CHANNEL_CATEGORIES = {
     "央卫综艺": [
         "CCTV-1综合", "湖南卫视", "纪实科教", "大湾区卫视", "CCTV-2财经", "湖南卫视4K", "凤凰卫视中文台", "浙江卫视", "凤凰卫视资讯台", "CCTV-3综艺", 
@@ -71,10 +55,10 @@ CHANNEL_CATEGORIES = {
     "体育竞技": [
         "劲爆体育", "快乐垂钓", "四海钓鱼", "来钓鱼吧", "睛彩竞技", "睛彩篮球", "睛彩广场舞", "魅力足球", "五星体育", "游戏风云", "武术世界", "哒啵赛事", "哒啵电竞",
         "先锋乒羽", "天元围棋", "汽摩", "电竞天堂", "青春动漫",
-    ],
+    ],#任意添加，与仓库中rtp/省份运营商.txt内频道一致即可，或在下方频道名映射中改名
 }
 
-# ===== 映射（别名 -> 标准名） =====（保持不变）
+# ===== 映射（别名 -> 标准名） =====
 CHANNEL_MAPPING = {
     "CCTV-1综合": ["CCTV-1", "CCTV-1 HD", "CCTV1 HD", "CCTV1"],
     "CCTV-2财经": ["CCTV-2", "CCTV-2 HD", "CCTV2 HD", "CCTV2"],
@@ -142,9 +126,9 @@ CHANNEL_MAPPING = {
     "山东卫视": ["山东卫视HD"],
     "四川卫视": ["四川卫视HD"],
     "浙江卫视": ["浙江卫视HD"],
-    "CHC影迷电影": ["CHC影迷电影HD", "CHC 影迷电影", "影迷电影", "CHC影迷电影高清"],
-    "CHC家庭影院": ["CHC 家庭影院", "CHC家庭影院HD", "CHC家庭影院高清"], 
-    "CHC动作电影": ["CHC 动作电影", "CHC动作电影HD", "CHC动作电影高清"],
+    "CHC影迷电影": ["CHC影迷电影HD", "CHC-影迷电影", "影迷电影", "chc影迷电影高清"],
+    "CHC家庭影院": ["CHC-家庭影院", "CHC家庭影院HD", "chc家庭影院高清"], 
+    "CHC动作电影": ["CHC-动作电影", "CHC动作电影HD", "CHC高清电影", "chc动作电影高清"],
     "淘电影": ["IPTV淘电影", "北京IPTV淘电影", "北京淘电影"],
     "淘剧场": ["IPTV淘剧场", "北京IPTV淘剧场", "北京淘剧场"],
     "淘4K": ["IPTV淘4K", "北京IPTV4K超高清", "北京淘4K", "淘4K", "北京IPTV淘4K", "北京IPTV4K超清", "4K超清"],
@@ -235,211 +219,9 @@ CHANNEL_MAPPING = {
     "爱家庭": ["爱家庭HD", "IHOT爱家庭", "iHOT爱家庭", "爱家庭高清"],
     "环球奇观": ["环球奇观HD"],
     "精彩影视": ["精彩影视高清"],
-}
+}#格式为"频道分类中的标准名": ["rtp/中的名字"],
 
 # ===============================
-# 新增：源评分管理类
-class SourceScoreManager:
-    def __init__(self, score_file=SOURCE_SCORE_FILE):
-        self.score_file = score_file
-        self.scores = self.load_scores()
-        self.lock = threading.Lock()
-    
-    def load_scores(self):
-        """加载源评分"""
-        if os.path.exists(self.score_file):
-            try:
-                with open(self.score_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-    
-    def save_scores(self):
-        """保存源评分"""
-        with open(self.score_file, 'w', encoding='utf-8') as f:
-            json.dump(self.scores, f, ensure_ascii=False, indent=2)
-    
-    def update_score(self, url, success, response_time=None):
-        """更新源评分"""
-        with self.lock:
-            if url not in self.scores:
-                self.scores[url] = {
-                    'success_count': 0,
-                    'fail_count': 0,
-                    'avg_response_time': 0,
-                    'last_check': time.time(),
-                    'score': 50  # 初始分数
-                }
-            
-            score_data = self.scores[url]
-            
-            if success:
-                score_data['success_count'] += 1
-                if response_time:
-                    # 更新平均响应时间
-                    old_avg = score_data['avg_response_time']
-                    count = score_data['success_count']
-                    score_data['avg_response_time'] = (old_avg * (count - 1) + response_time) / count
-                
-                # 分数计算公式：基础分 + 成功率 * 30 + 响应时间因子 * 20
-                success_rate = score_data['success_count'] / max(1, score_data['success_count'] + score_data['fail_count'])
-                time_score = max(0, min(20, 20 * (1 - (score_data['avg_response_time'] / 10))))  # 响应时间越快分数越高
-                score_data['score'] = 50 + success_rate * 30 + time_score
-            else:
-                score_data['fail_count'] += 1
-                # 失败降分
-                score_data['score'] = max(0, score_data['score'] - 10)
-            
-            score_data['last_check'] = time.time()
-            self.save_scores()
-    
-    def get_best_sources(self, urls, limit=3):
-        """获取评分最高的源"""
-        scored = [(url, self.scores.get(url, {}).get('score', 50)) for url in urls]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [url for url, score in scored[:limit]]
-
-# ===============================
-# 新增：流媒体检测优化类
-class StreamChecker:
-    def __init__(self, timeout=CHECK_TIMEOUT, retries=CHECK_RETRIES):
-        self.timeout = timeout
-        self.retries = retries
-        self.cache = {}
-        self.cache_time = {}
-        self.lock = threading.Lock()
-    
-    def check_stream(self, url, force=False):
-        """检查流媒体是否可用，带缓存和重试机制"""
-        current_time = time.time()
-        
-        # 检查缓存
-        with self.lock:
-            if not force and url in self.cache:
-                if current_time - self.cache_time.get(url, 0) < 60:  # 缓存1分钟
-                    return self.cache[url]
-        
-        for i in range(self.retries):
-            try:
-                start_time = time.time()
-                
-                # 使用ffprobe检测，增加超时控制
-                result = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_streams", "-i", url],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=self.timeout + 2,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                )
-                
-                response_time = time.time() - start_time
-                success = b"codec_type" in result.stdout
-                
-                # 更新缓存
-                with self.lock:
-                    self.cache[url] = success
-                    self.cache_time[url] = current_time
-                
-                return success, response_time
-                
-            except subprocess.TimeoutExpired:
-                if i == self.retries - 1:
-                    with self.lock:
-                        self.cache[url] = False
-                        self.cache_time[url] = current_time
-                    return False, self.timeout
-            except Exception:
-                if i == self.retries - 1:
-                    with self.lock:
-                        self.cache[url] = False
-                        self.cache_time[url] = current_time
-                    return False, None
-                time.sleep(0.5)
-        
-        return False, None
-    
-    def batch_check(self, urls, max_workers=5):
-        """批量检测流媒体"""
-        results = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {executor.submit(self.check_stream, url): url for url in urls}
-            for future in concurrent.futures.as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    success, response_time = future.result()
-                    results[url] = (success, response_time)
-                except Exception as e:
-                    results[url] = (False, None)
-        return results
-
-# ===============================
-# 新增：智能源选择器
-class SourceSelector:
-    def __init__(self):
-        self.score_manager = SourceScoreManager()
-        self.checker = StreamChecker()
-        self.source_groups = defaultdict(list)  # 按频道分组的源
-    
-    def add_source(self, channel, url, operator):
-        """添加源到分组"""
-        self.source_groups[channel].append({
-            'url': url,
-            'operator': operator,
-            'last_check': 0,
-            'score': 50
-        })
-    
-    def select_best_source(self, channel):
-        """为频道选择最佳源"""
-        if channel not in self.source_groups:
-            return None
-        
-        sources = self.source_groups[channel]
-        
-        # 获取所有源的URL
-        urls = [s['url'] for s in sources]
-        
-        # 按评分排序
-        best_urls = self.score_manager.get_best_sources(urls, limit=3)
-        
-        # 检测最佳的几个源
-        for url in best_urls:
-            success, response_time = self.checker.check_stream(url)
-            if success:
-                # 更新评分
-                self.score_manager.update_score(url, True, response_time)
-                return url
-            else:
-                self.score_manager.update_score(url, False)
-        
-        return None
-    
-    def get_all_sources(self, channel):
-        """获取频道的所有可用源"""
-        if channel not in self.source_groups:
-            return []
-        
-        sources = self.source_groups[channel]
-        urls = [s['url'] for s in sources]
-        
-        # 批量检测
-        results = self.checker.batch_check(urls)
-        
-        # 更新评分并返回可用源
-        available = []
-        for url, (success, response_time) in results.items():
-            if success:
-                self.score_manager.update_score(url, True, response_time)
-                available.append(url)
-            else:
-                self.score_manager.update_score(url, False)
-        
-        # 按评分排序
-        return self.score_manager.get_best_sources(available)
-
-# ===============================
-# 原有的函数（保持基本不变，但可能调用新的类）
 def get_run_count():
     if os.path.exists(COUNTER_FILE):
         try:
@@ -455,6 +237,8 @@ def save_run_count(count):
     except Exception as e:
         print(f"⚠️ 写计数文件失败：{e}")
 
+
+# ===============================
 def get_isp_from_api(data):
     isp_raw = (data.get("isp") or "").lower()
 
@@ -466,6 +250,7 @@ def get_isp_from_api(data):
         return "移动"
 
     return "未知"
+
 
 def get_isp_by_regex(ip):
     if re.match(r"^(1[0-9]{2}|2[0-3]{2}|1|14|42|43|58|59|60|61|106|110|111|112|113|114|115|116|117|118|119|120|121|122|123|124|125|126|127|139|171|175|180|182|183|184|185|186|187|188|189|218|219|220|221|222|223)\.", ip):
@@ -479,8 +264,9 @@ def get_isp_by_regex(ip):
 
     return "未知"
 
+
 # ===============================
-# 第一阶段（优化：增加IP去重和验证）
+# 第一阶段
 def first_stage():
     os.makedirs(IP_DIR, exist_ok=True)
     all_ips = set()
@@ -490,13 +276,7 @@ def first_stage():
         try:
             r = requests.get(url, headers=HEADERS, timeout=15)
             urls_all = re.findall(r'<a href="http://(.*?)"', r.text)
-            # 基本验证IP格式
-            for u in urls_all:
-                u = u.strip()
-                if u and ':' in u:
-                    ip_part = u.split(':')[0]
-                    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip_part) or re.match(r'^[a-zA-Z0-9.-]+$', ip_part):
-                        all_ips.add(u)
+            all_ips.update(u.strip() for u in urls_all if u.strip())
         except Exception as e:
             print(f"❌ 爬取失败：{e}")
         time.sleep(3)
@@ -520,17 +300,8 @@ def first_stage():
             else:
                 ip = host
 
-            # 增加重试机制
-            for retry in range(3):
-                try:
-                    res = requests.get(f"http://ip-api.com/json/{ip}?lang=zh-CN", timeout=10)
-                    if res.status_code == 200:
-                        data = res.json()
-                        break
-                except:
-                    if retry == 2:
-                        raise
-                    time.sleep(1)
+            res = requests.get(f"http://ip-api.com/json/{ip}?lang=zh-CN", timeout=10)
+            data = res.json()
 
             province = data.get("regionName", "未知")
             isp = get_isp_from_api(data)
@@ -555,27 +326,19 @@ def first_stage():
     for filename, ip_set in province_isp_dict.items():
         path = os.path.join(IP_DIR, filename)
         try:
-            # 读取现有IP去重
-            existing_ips = set()
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    existing_ips = set(line.strip() for line in f if line.strip())
-            
-            # 合并新IP
-            all_ips = existing_ips.union(ip_set)
-            
-            with open(path, "w", encoding="utf-8") as f:
-                for ip_port in sorted(all_ips):
+            with open(path, "a", encoding="utf-8") as f:
+                for ip_port in sorted(ip_set):
                     f.write(ip_port + "\n")
-            print(f"{path} 已写入 {len(all_ips)} 个 IP（新增 {len(ip_set)}）")
+            print(f"{path} 已追加写入 {len(ip_set)} 个 IP")
         except Exception as e:
             print(f"❌ 写入 {path} 失败：{e}")
 
     print(f"✅ 第一阶段完成，当前轮次：{count}")
     return count
 
+
 # ===============================
-# 第二阶段（优化：增加URL有效性预检）
+# 第二阶段
 def second_stage():
     print("🔔 第二阶段触发：生成 zubo.txt")
     if not os.path.exists(IP_DIR):
@@ -588,34 +351,25 @@ def second_stage():
         print("⚠️ rtp 目录不存在，无法进行第二阶段组合，跳过")
         return
 
-    # 预检IP有效性
-    valid_ips = {}
     for ip_file in os.listdir(IP_DIR):
         if not ip_file.endswith(".txt"):
             continue
-        ip_path = os.path.join(IP_DIR, ip_file)
-        try:
-            with open(ip_path, encoding="utf-8") as f:
-                ips = [x.strip() for x in f if x.strip()]
-                if ips:
-                    valid_ips[ip_file] = ips
-        except Exception as e:
-            print(f"⚠️ 读取 {ip_path} 失败：{e}")
 
-    for ip_file, ip_lines in valid_ips.items():
+        ip_path = os.path.join(IP_DIR, ip_file)
         rtp_path = os.path.join(RTP_DIR, ip_file)
 
         if not os.path.exists(rtp_path):
             continue
 
         try:
-            with open(rtp_path, encoding="utf-8") as f2:
+            with open(ip_path, encoding="utf-8") as f1, open(rtp_path, encoding="utf-8") as f2:
+                ip_lines = [x.strip() for x in f1 if x.strip()]
                 rtp_lines = [x.strip() for x in f2 if x.strip()]
         except Exception as e:
             print(f"⚠️ 文件读取失败：{e}")
             continue
 
-        if not rtp_lines:
+        if not ip_lines or not rtp_lines:
             continue
 
         for ip_port in ip_lines:
@@ -633,42 +387,42 @@ def second_stage():
                     part = rtp_url.split("udp://", 1)[1]
                     combined_lines.append(f"{ch_name},http://{ip_port}/udp/{part}")
 
-    # 去重并保留所有可用源（不合并，保留多源）
-    unique_sources = {}
+    # 去重
+    unique = {}
     for line in combined_lines:
-        name, url = line.split(",", 1)
-        key = f"{name},{url}"
-        if key not in unique_sources:
-            unique_sources[key] = line
+        url_part = line.split(",", 1)[1]
+        if url_part not in unique:
+            unique[url_part] = line
 
     try:
         with open(ZUBO_FILE, "w", encoding="utf-8") as f:
-            for line in unique_sources.values():
+            for line in unique.values():
                 f.write(line + "\n")
-        print(f"🎯 第二阶段完成，写入 {len(unique_sources)} 条记录（含多源）")
+        print(f"🎯 第二阶段完成，写入 {len(unique)} 条记录")
     except Exception as e:
         print(f"❌ 写文件失败：{e}")
 
-# ===============================
-# 在文件开头的配置区添加（放在现有配置后面）
-MAX_RUNTIME = 10800  # 最大运行时间：3小时（10800秒）
-MAX_SOURCES_PER_CHANNEL_CHECK = 60  # 每个频道最多检测60个源
-BATCH_SIZE = 15  # 每批检测15个频道
-# ===============================
 
 # ===============================
-# 优化后的第三阶段（简化版）
+# 第三阶段
 def third_stage():
-    print("🧩 第三阶段：智能多源检测生成 IPTV.txt")
-    start_time = time.time()
+    print("🧩 第三阶段：多线程检测代表频道生成 IPTV.txt 并写回可用 IP 到 ip/目录（覆盖）")
 
     if not os.path.exists(ZUBO_FILE):
         print("⚠️ zubo.txt 不存在，跳过第三阶段")
         return
 
-    # 初始化检测工具
-    checker = StreamChecker()
-    score_manager = SourceScoreManager()
+    def check_stream(url, timeout=5):
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-i", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout + 2
+            )
+            return b"codec_type" in result.stdout
+        except Exception:
+            return False
 
     # 别名映射
     alias_map = {}
@@ -676,7 +430,7 @@ def third_stage():
         for alias in aliases:
             alias_map[alias] = main_name
 
-    # 读取IP信息
+    # 读取现有 ip 文件，建立 ip_port -> operator 映射
     ip_info = {}
     if os.path.exists(IP_DIR):
         for fname in os.listdir(IP_DIR):
@@ -692,100 +446,60 @@ def third_stage():
             except Exception as e:
                 print(f"⚠️ 读取 {fname} 失败：{e}")
 
-    # 读取zubo.txt
-    channel_sources = defaultdict(list)
+    # 读取 zubo.txt 并按 ip:port 分组
+    groups = {}
     with open(ZUBO_FILE, encoding="utf-8") as f:
         for line in f:
             if "," not in line:
                 continue
+
             ch_name, url = line.strip().split(",", 1)
             ch_main = alias_map.get(ch_name, ch_name)
             m = re.match(r"http://([^/]+)/", url)
             if not m:
                 continue
+
             ip_port = m.group(1)
-            operator = ip_info.get(ip_port, "未知")
-            channel_sources[ch_main].append({
-                'url': url,
-                'operator': operator,
-                'ip_port': ip_port
-            })
 
-    print(f"🚀 开始智能检测（共 {len(channel_sources)} 个频道）")
-    print(f"⏰ 时间限制: {MAX_RUNTIME/3600:.1f}小时")
+            groups.setdefault(ip_port, []).append((ch_main, url))
 
-    valid_sources_per_channel = {}
-    channels_processed = 0
-    
-    # 按源数量排序，先处理源少的频道
-    sorted_channels = sorted(channel_sources.items(), key=lambda x: len(x[1]))
-    
-    for channel, sources in sorted_channels:
-        # 检查是否超时
-        elapsed = time.time() - start_time
-        if elapsed > MAX_RUNTIME:
-            print(f"⏰ 达到时间限制，停止检测。已处理 {channels_processed}/{len(sorted_channels)} 个频道")
-            break
-            
-        channels_processed += 1
-        total_sources = len(sources)
-        
-        print(f"\n  [{channels_processed}/{len(sorted_channels)}] 📺 检测频道: {channel}")
-        print(f"    总源数: {total_sources} | 已用时: {elapsed/60:.1f}分钟")
-        
-        # === 核心优化：限制检测数量 ===
-        # 如果源太多，只检测前 MAX_SOURCES_PER_CHANNEL_CHECK 个
-        if total_sources > MAX_SOURCES_PER_CHANNEL_CHECK:
-            # 随机抽样检测，避免每次都检测同样的源
-            sources_to_check = random.sample(sources, MAX_SOURCES_PER_CHANNEL_CHECK)
-            print(f"    源数过多，随机检测 {MAX_SOURCES_PER_CHANNEL_CHECK} 个")
-        else:
-            sources_to_check = sources
-        
-        # 批量检测
-        urls = [s['url'] for s in sources_to_check]
-        results = checker.batch_check(urls, max_workers=10)
-        
-        # 收集可用源
-        available_sources = []
-        for source in sources_to_check:
-            url = source['url']
-            success, response_time = results.get(url, (False, None))
-            
-            if success:
-                score_manager.update_score(url, True, response_time)
-                available_sources.append({
-                    'url': url,
-                    'operator': source['operator'],
-                    'ip_port': source['ip_port'],
-                    'score': score_manager.scores.get(url, {}).get('score', 50),
-                    'response_time': response_time
-                })
-            else:
-                score_manager.update_score(url, False)
-        
-        # 按评分排序，取前MAX_SOURCES_PER_CHANNEL个
-        available_sources.sort(key=lambda x: x['score'], reverse=True)
-        valid_sources_per_channel[channel] = available_sources[:MAX_SOURCES_PER_CHANNEL]
-        
-        print(f"    ✅ 可用: {len(available_sources)} 个，保留 {len(valid_sources_per_channel[channel])} 个")
+    # 选择代表频道并检测
+    def detect_ip(ip_port, entries):
+        rep_channels = [u for c, u in entries if c == "CCTV1"]
+        if not rep_channels and entries:
+            rep_channels = [entries[0][1]]
+        playable = any(check_stream(u) for u in rep_channels)
+        return ip_port, playable
 
-    # 统计可用IP
+    print(f"🚀 启动多线程检测（共 {len(groups)} 个 IP）...")
     playable_ips = set()
-    for sources in valid_sources_per_channel.values():
-        for source in sources:
-            playable_ips.add(source['ip_port'])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(detect_ip, ip, chs): ip for ip, chs in groups.items()}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                ip_port, ok = future.result()
+            except Exception as e:
+                print(f"⚠️ 线程检测返回异常：{e}")
+                continue
+            if ok:
+                playable_ips.add(ip_port)
 
-    elapsed_total = time.time() - start_time
-    print(f"\n✅ 检测完成，总用时 {elapsed_total/60:.1f} 分钟")
-    print(f"   处理频道: {channels_processed} 个")
-    print(f"   可用IP: {len(playable_ips)} 个")
+    print(f"✅ 检测完成，可播放 IP 共 {len(playable_ips)} 个")
 
-    # 更新IP文件
-    operator_playable_ips = defaultdict(set)
+    valid_lines = []
+    seen = set()
+    operator_playable_ips = {}
+
     for ip_port in playable_ips:
         operator = ip_info.get(ip_port, "未知")
-        operator_playable_ips[operator].add(ip_port)
+
+        for c, u in groups.get(ip_port, []):
+            key = f"{c},{u}"
+            if key not in seen:
+                seen.add(key)
+                valid_lines.append(f"{c},{u}${operator}")
+
+                operator_playable_ips.setdefault(operator, set()).add(ip_port)
 
     for operator, ip_set in operator_playable_ips.items():
         target_file = os.path.join(IP_DIR, operator + ".txt")
@@ -797,87 +511,27 @@ def third_stage():
         except Exception as e:
             print(f"❌ 写回 {target_file} 失败：{e}")
 
-    # 生成IPTV.txt
+    # 写 IPTV.txt（包含更新时间与分类）
     beijing_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     disclaimer_url = "https://kakaxi-1.asia/LOGO/Disclaimer.mp4"
 
     try:
         with open(IPTV_FILE, "w", encoding="utf-8") as f:
-            f.write(f"更新时间: {beijing_now}（北京时间）\n")
-            f.write(f"检测用时: {elapsed_total/60:.1f} 分钟\n\n")
+            f.write(f"更新时间: {beijing_now}（北京时间）\n\n")
             f.write("更新时间,#genre#\n")
             f.write(f"{beijing_now},{disclaimer_url}\n\n")
 
             for category, ch_list in CHANNEL_CATEGORIES.items():
                 f.write(f"{category},#genre#\n")
                 for ch in ch_list:
-                    if ch in valid_sources_per_channel and valid_sources_per_channel[ch]:
-                        sources = valid_sources_per_channel[ch]
-                        for i, source in enumerate(sources, 1):
-                            if len(sources) > 1:
-                                f.write(f"{ch},{source['url']}$运营:{source['operator']} [备用{i}]\n")
-                            else:
-                                f.write(f"{ch},{source['url']}$运营:{source['operator']}\n")
-                    else:
-                        f.write(f"# {ch},暂无可用源\n")
+                    for line in valid_lines:
+                        name = line.split(",", 1)[0]
+                        if name == ch:
+                            f.write(line + "\n")
                 f.write("\n")
-        
-        # 生成M3U
-        generate_m3u_simple(valid_sources_per_channel, beijing_now)
-        
-        print(f"🎯 IPTV.txt 生成完成")
+        print(f"🎯 IPTV.txt 生成完成，共 {len(valid_lines)} 条频道")
     except Exception as e:
         print(f"❌ 写 IPTV.txt 失败：{e}")
-
-def generate_m3u_simple(channel_sources, update_time):
-    """简化版M3U生成"""
-    m3u_file = "IPTV.m3u"
-    try:
-        with open(m3u_file, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n")
-            f.write(f"#EXTINF:-1 group-title=\"更新时间\",{update_time}\n\n")
-            
-            for channel, sources in channel_sources.items():
-                if not sources:
-                    continue
-                for i, source in enumerate(sources, 1):
-                    title = f"{channel} [备用{i}]" if len(sources) > 1 else channel
-                    f.write(f"#EXTINF:-1 group-title=\"自动分类\",{title}\n")
-                    f.write(f"{source['url']}\n")
-        
-        print(f"📺 M3U文件生成完成: {m3u_file}")
-    except Exception as e:
-        print(f"❌ 生成M3U失败：{e}")
-
-# ===============================
-# 新增：快速切换支持文件
-def generate_quick_switch_support():
-    """生成支持快速切换的辅助文件"""
-    quick_file = "quick_switch.json"
-    try:
-        if os.path.exists(IPTV_FILE):
-            channel_map = {}
-            with open(IPTV_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    if "," in line and not line.startswith("#") and not line.startswith("更新时间"):
-                        parts = line.strip().split(",")
-                        if len(parts) >= 2:
-                            ch_name = parts[0]
-                            url = parts[1].split("$")[0]  # 去掉备注
-                            if ch_name not in channel_map:
-                                channel_map[ch_name] = []
-                            channel_map[ch_name].append(url)
-            
-            # 保存为JSON
-            with open(quick_file, "w", encoding="utf-8") as f:
-                json.dump({
-                    "update_time": datetime.now().isoformat(),
-                    "channels": channel_map
-                }, f, ensure_ascii=False, indent=2)
-            
-            print(f"⚡ 快速切换支持文件生成: {quick_file}")
-    except Exception as e:
-        print(f"❌ 生成快速切换文件失败：{e}")
 
 # ===============================
 # 文件推送
@@ -892,10 +546,7 @@ def push_all_files():
     os.system("git add 计数.txt || true")
     os.system("git add ip/*.txt || true")
     os.system("git add IPTV.txt || true")
-    os.system("git add IPTV.m3u || true")
-    os.system("git add source_scores.json || true")
-    os.system("git add quick_switch.json || true")
-    os.system('git commit -m "自动更新：多源检测优化" || echo "⚠️ 无需提交"')
+    os.system('git commit -m "自动更新：计数、IP文件、IPTV.txt" || echo "⚠️ 无需提交"')
     os.system("git push origin main || echo '⚠️ 推送失败'")
 
 # ===============================
@@ -904,14 +555,12 @@ if __name__ == "__main__":
     # 确保目录存在
     os.makedirs(IP_DIR, exist_ok=True)
     os.makedirs(RTP_DIR, exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
 
     run_count = first_stage()
 
     if run_count % 10 == 0:
         second_stage()
         third_stage()
-        generate_quick_switch_support()
     else:
         print("ℹ️ 本次不是 10 的倍数，跳过第二、三阶段")
 
