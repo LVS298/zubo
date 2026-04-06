@@ -1,0 +1,67 @@
+name: IPTV自动更新
+
+on:
+  schedule:
+    # 每天北京时间8:00和20:00运行
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:  # 允许手动触发
+  push:
+    branches: [ main ]
+    paths:
+      - 'rtp/*.txt'  # 当rtp文件更新时触发
+
+jobs:
+  update-iptv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: 设置Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+    
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+    
+    - name: 运行IPTV更新脚本
+      env:
+        FOFA_EMAIL: ${{ secrets.FOFA_EMAIL }}
+        FOFA_KEY: ${{ secrets.FOFA_KEY }}
+        FOFA_QUERY: '"udpxy" && country="CN" && is_honeypot=false'
+        MAX_IPS_PER_FILE: "20"
+        TEST_TIMEOUT: "5"
+        RUN_EVERY_N: "3"
+      run: |
+        python iptv_updater.py
+    
+    - name: 查看生成结果
+      run: |
+        echo "=== IP文件列表 ==="
+        ls -la ip/ 2>/dev/null || echo "无IP文件"
+        echo ""
+        echo "=== IPTV.txt 预览 ==="
+        head -50 IPTV.txt 2>/dev/null || echo "无IPTV.txt"
+        echo ""
+        echo "=== 运行计数 ==="
+        cat 计数.txt 2>/dev/null || echo "无计数文件"
+    
+    - name: 上传生成的文件
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: iptv-output
+        path: |
+          IPTV.txt
+          ip/*.txt
+          zubo.txt
+          计数.txt
+        retention-days: 7
